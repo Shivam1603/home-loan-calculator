@@ -5,7 +5,30 @@ from datetime import datetime
 
 # ---------------- CONFIG ----------------
 DB = "loan.db"
-ANNUAL_RATE = 0.0725  # Change if needed
+ANNUAL_RATE = 0.0725
+
+
+# ---------------- INDIAN NUMBER FORMAT ----------------
+def format_inr(x):
+    x = round(float(x), 2)
+    sign = "-" if x < 0 else ""
+    x = abs(x)
+
+    integer, dot, fraction = f"{x:.2f}".partition(".")
+
+    if len(integer) > 3:
+        last3 = integer[-3:]
+        rest = integer[:-3]
+        parts = []
+        while len(rest) > 2:
+            parts.insert(0, rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            parts.insert(0, rest)
+        integer = ",".join(parts + [last3])
+
+    return f"{sign}₹ {integer}.{fraction}"
+
 
 # ---------------- DATABASE ----------------
 def get_conn():
@@ -54,9 +77,9 @@ def signed_amount(row):
     t = row["type"]
     amt = row["amount"]
 
-    if t in ["Disbursement", "Interest", "Charge (Credit)"]:
+    if t in ["Disbursement", "Interest", "Charge (Debit)"]:
         return amt
-    elif t in ["EMI", "Prepayment", "Charge (Debit)"]:
+    elif t in ["EMI", "Prepayment", "Charge (Credit)"]:
         return -amt
     return amt
 
@@ -66,6 +89,7 @@ def build_daily_table(df):
     if df.empty:
         return pd.DataFrame()
 
+    df = df.copy()
     df["signed_amount"] = df.apply(signed_amount, axis=1)
 
     start = pd.to_datetime(df["date"].min())
@@ -73,11 +97,7 @@ def build_daily_table(df):
 
     dates = pd.date_range(start, end)
 
-    tx_map = (
-        df.groupby("date")["signed_amount"]
-        .sum()
-        .to_dict()
-    )
+    tx_map = df.groupby("date")["signed_amount"].sum().to_dict()
 
     balance = 0
     monthly_interest = 0
@@ -89,18 +109,15 @@ def build_daily_table(df):
         ds = d.strftime("%Y-%m-%d")
         month_key = d.strftime("%Y-%m")
 
-        # New month → add last month's interest
         if current_month is not None and month_key != current_month:
             balance += monthly_interest
             monthly_interest = 0
 
         current_month = month_key
 
-        # Apply transactions
         if ds in tx_map:
             balance += tx_map[ds]
 
-        # Daily interest on day-end outstanding
         interest = balance * ANNUAL_RATE / 365
         monthly_interest += interest
 
@@ -113,10 +130,7 @@ def build_daily_table(df):
         })
 
     daily = pd.DataFrame(rows)
-
-    # Serial numbers reset per month
     daily["SNo"] = daily.groupby("MonthKey").cumcount() + 1
-
     return daily
 
 
@@ -142,11 +156,36 @@ if menu == "Dashboard":
     else:
         latest_balance = daily.iloc[-1]["Outstanding"]
 
-        col1, col2 = st.columns(2)
-        col1.metric("Outstanding Balance", f"₹ {latest_balance:,.0f}")
-        col2.metric(
-            "Today's Interest",
-            f"₹ {daily.iloc[-1]['Interest']:,.0f}"
+        # ---- Interest metrics ----
+        total_interest_paid = daily["Interest"].sum()
+
+        emi_only_tx = tx[tx["type"].isin(["Disbursement", "EMI"])]
+        emi_daily = build_daily_table(emi_only_tx)
+
+        interest_without_prepay = (
+            emi_daily["Interest"].sum()
+            if not emi_daily.empty else 0
+        )
+
+        interest_saved = (
+            interest_without_prepay - total_interest_paid
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric("Outstanding Balance",
+                    format_inr(latest_balance))
+
+        col2.metric("Today's Interest",
+                    format_inr(daily.iloc[-1]["Interest"]))
+
+        col3.metric("Interest Paid So Far",
+                    format_inr(total_interest_paid))
+
+        col4.metric(
+            "Interest Saved",
+            format_inr(max(interest_saved, 0)),
+            help="Interest saved compared to a scenario where only EMIs were paid and no prepayments were made."
         )
 
         st.subheader("Daily Loan Table")
@@ -169,6 +208,12 @@ if menu == "Dashboard":
                     "Interest Accrued (Day)"
                 ]
 
+                display["Outstanding Balance"] = \
+                    display["Outstanding Balance"].apply(format_inr)
+
+                display["Interest Accrued (Day)"] = \
+                    display["Interest Accrued (Day)"].apply(format_inr)
+
                 st.dataframe(
                     display,
                     use_container_width=True,
@@ -179,7 +224,7 @@ if menu == "Dashboard":
 
                 st.markdown(
                     f"**Total interest accrued in {month_label}: "
-                    f"₹ {total_interest:,.2f}**"
+                    f"{format_inr(total_interest)}**"
                 )
 
 # ---------------- TRANSACTIONS ----------------
@@ -196,7 +241,7 @@ elif menu == "Transactions":
 
             cols[0].write(row["date"])
             cols[1].write(row["type"])
-            cols[2].write(f"{row['amount']:,.0f}")
+            cols[2].write(format_inr(row["amount"]))
             cols[3].write(row["note"])
 
             if cols[4].button("❌", key=row["id"]):
@@ -216,8 +261,8 @@ elif menu == "Add Transaction":
             "EMI",
             "Prepayment",
             "Interest",
-            "Charge (Credit)",
             "Charge (Debit)",
+            "Charge (Credit)",
         ]
     )
 
