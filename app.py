@@ -1,11 +1,16 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 from datetime import datetime
 
+import psycopg2
+import os
+
 # ---------------- CONFIG ----------------
-DB = "loan.db"
 ANNUAL_RATE = 0.0725
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    DATABASE_URL = st.secrets["DATABASE_URL"]
 
 
 # ---------------- INDIAN NUMBER FORMAT ----------------
@@ -32,44 +37,48 @@ def format_inr(x):
 
 # ---------------- DATABASE ----------------
 def get_conn():
-    return sqlite3.connect(DB, check_same_thread=False)
-
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     conn = get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS transactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id SERIAL PRIMARY KEY,
+            date DATE,
             type TEXT,
-            amount REAL,
+            amount NUMERIC,
             note TEXT
         )
     """)
     conn.commit()
-
+    cur.close()
+    conn.close()
 
 def add_transaction(date, ttype, amount, note):
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO transactions(date,type,amount,note) VALUES (?,?,?,?)",
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO transactions(date,type,amount,note) VALUES (%s,%s,%s,%s)",
         (date, ttype, amount, note),
     )
     conn.commit()
-
+    cur.close()
+    conn.close()
 
 def delete_transaction(tx_id):
     conn = get_conn()
-    conn.execute("DELETE FROM transactions WHERE id=?", (tx_id,))
+    cur = conn.cursor()
+    cur.execute("DELETE FROM transactions WHERE id=%s", (tx_id,))
     conn.commit()
-
+    cur.close()
+    conn.close()
 
 def load_transactions():
     conn = get_conn()
-    return pd.read_sql(
-        "SELECT * FROM transactions ORDER BY date, id",
-        conn
-    )
+    df = pd.read_sql("SELECT * FROM transactions ORDER BY date, id", conn)
+    conn.close()
+    return df
 
 
 # ---------------- SIGN HANDLING ----------------
@@ -83,11 +92,91 @@ def signed_amount(row):
         return -amt
     return amt
 
+# ---------------- LIFETIME SIMULATION ----------------
+def simulate_until_closure(df, emi_amount=90352, emi_only=False):
+    if df.empty:
+        raise ValueError("Simulation requires at least one disbursement transaction.")
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["signed_amount"] = df.apply(signed_amount, axis=1)
+
+    start = pd.to_datetime(df["date"].min())
+    last_tx_date = pd.to_datetime(df["date"].max())
+
+    tx_map = (
+        df.groupby(df["date"].dt.strftime("%Y-%m-%d"))["signed_amount"]
+        .sum()
+        .to_dict()
+    )
+
+    current_date = start
+    balance = 0
+    monthly_interest = 0
+    current_month = None
+
+    rows = []
+
+    while balance > 0 or current_date == start:
+
+        ds = current_date.strftime("%Y-%m-%d")
+        month_key = current_date.strftime("%Y-%m")
+
+        monthly_capitalized = 0
+        emi_applied = 0
+
+        # Capitalize interest at month change
+        if current_month is not None and month_key != current_month:
+            balance += monthly_interest
+            monthly_capitalized = monthly_interest
+            monthly_interest = 0
+
+        current_month = month_key
+
+        # ---------------- HISTORICAL PHASE ----------------
+        if current_date <= last_tx_date:
+            if ds in tx_map:
+                balance += tx_map[ds]
+
+        # ---------------- EMI APPLICATION ----------------
+        # EMI-only simulation → apply every 20th from start
+        if emi_only:
+            if current_date.day == 20:
+                emi_applied = min(balance, emi_amount)
+                balance -= emi_applied
+
+        # Actual simulation → apply EMI only AFTER last tx date
+        else:
+            if current_date > last_tx_date and current_date.day == 20:
+                emi_applied = min(balance, emi_amount)
+                balance -= emi_applied
+
+        if balance <= 0:
+            break
+
+        # Daily interest
+        interest = balance * ANNUAL_RATE / 365
+        monthly_interest += interest
+
+        rows.append({
+            "Date": current_date,
+            "Outstanding": balance,
+            "Interest Today": interest,
+            "EMI Applied": emi_applied,
+            "Monthly Interest Capitalized": monthly_capitalized
+        })
+
+        current_date += pd.Timedelta(days=1)
+
+    return pd.DataFrame(rows)
 
 # ---------------- LOAN ENGINE ----------------
 def build_daily_table(df):
     if df.empty:
         return pd.DataFrame()
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
 
     df = df.copy()
     df["signed_amount"] = df.apply(signed_amount, axis=1)
@@ -97,7 +186,12 @@ def build_daily_table(df):
 
     dates = pd.date_range(start, end)
 
-    tx_map = df.groupby("date")["signed_amount"].sum().to_dict()
+    tx_map = (
+        df.groupby(df["date"].dt.strftime("%Y-%m-%d"))["signed_amount"]
+        .sum()
+        .to_dict()
+    )
+
 
     balance = 0
     monthly_interest = 0
@@ -141,7 +235,7 @@ st.set_page_config(page_title="Loan Tracker", layout="wide")
 
 menu = st.sidebar.radio(
     "Menu",
-    ["Dashboard", "Transactions", "Add Transaction"]
+    ["Dashboard", "Simulation", "Transactions", "Add Transaction"]
 )
 
 # ---------------- DASHBOARD ----------------
@@ -171,7 +265,33 @@ if menu == "Dashboard":
             interest_without_prepay - total_interest_paid
         )
 
-        col1, col2, col3, col4 = st.columns(4)
+        # ---- Extrapolated lifetime comparison ----
+        emi_amount = 90352
+
+        emi_only_schedule = simulate_until_closure(
+            emi_only_tx, emi_amount
+        )
+
+        actual_schedule = simulate_until_closure(
+            tx, emi_amount
+        )
+
+        emi_only_lifetime_interest = (
+            emi_only_schedule["Interest Today"].sum()
+            if not emi_only_schedule.empty else 0
+        )
+
+        actual_lifetime_interest = (
+            actual_schedule["Interest Today"].sum()
+            if not actual_schedule.empty else 0
+        )
+
+        interest_saved_extrapolated = (
+            emi_only_lifetime_interest - actual_lifetime_interest
+        )
+
+
+        col1, col2, col3, col4, col5 = st.columns(5)
 
         col1.metric("Outstanding Balance",
                     format_inr(latest_balance))
@@ -187,6 +307,13 @@ if menu == "Dashboard":
             format_inr(max(interest_saved, 0)),
             help="Interest saved compared to a scenario where only EMIs were paid and no prepayments were made."
         )
+
+        col5.metric(
+            "Interest Saved (Extrapolated)",
+            format_inr(max(interest_saved_extrapolated, 0)),
+            help="Total lifetime interest saved assuming EMI of ₹90,352 continues and no future prepayments are made."
+        )
+
 
         st.subheader("Daily Loan Table")
 
@@ -278,3 +405,65 @@ elif menu == "Add Transaction":
         add_transaction(str(date), ttype, amount, note)
         st.success("Transaction added!")
         st.rerun()
+
+elif menu == "Simulation":
+    st.title("📊 Loan Simulation Dashboard")
+
+    tx = load_transactions()
+
+    if tx.empty:
+        st.info("No transactions available.")
+    else:
+        emi_amount = 90352
+
+        # EMI Only
+        emi_only_tx = tx[tx["type"].isin(["Disbursement"])]
+        emi_only_tx = tx[tx["type"] == "Disbursement"]
+        emi_schedule = simulate_until_closure(emi_only_tx, emi_amount=90352, emi_only=True)
+
+        # Actual Scenario
+        actual_schedule = simulate_until_closure(tx, emi_amount=90352, emi_only=False)
+
+        emi_total_interest = emi_schedule["Interest Today"].sum()
+        actual_total_interest = actual_schedule["Interest Today"].sum()
+
+        interest_saved_extrapolated = emi_total_interest - actual_total_interest
+
+        emi_closure = emi_schedule.iloc[-1]["Date"]
+        actual_closure = actual_schedule.iloc[-1]["Date"]
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric("EMI-Only Total Interest",
+                    format_inr(emi_total_interest))
+
+        col2.metric("Actual Total Interest",
+                    format_inr(actual_total_interest))
+
+        col3.metric("Interest Saved (Extrapolated)",
+                    format_inr(max(interest_saved_extrapolated, 0)))
+
+        st.write("EMI-Only Closure Date:", emi_closure.date())
+        st.write("Actual Closure Date:", actual_closure.date())
+
+        st.divider()
+
+        with st.expander("📘 EMI-Only Full Simulation", expanded=False):
+            display_emi = emi_schedule.copy()
+            display_emi["Outstanding"] = display_emi["Outstanding"].apply(format_inr)
+            display_emi["Interest Today"] = display_emi["Interest Today"].apply(format_inr)
+            display_emi["EMI Applied"] = display_emi["EMI Applied"].apply(format_inr)
+            display_emi["Monthly Interest Capitalized"] = \
+                display_emi["Monthly Interest Capitalized"].apply(format_inr)
+
+            st.dataframe(display_emi, use_container_width=True, hide_index=True)
+
+        with st.expander("📗 Actual Full Simulation", expanded=False):
+            display_actual = actual_schedule.copy()
+            display_actual["Outstanding"] = display_actual["Outstanding"].apply(format_inr)
+            display_actual["Interest Today"] = display_actual["Interest Today"].apply(format_inr)
+            display_actual["EMI Applied"] = display_actual["EMI Applied"].apply(format_inr)
+            display_actual["Monthly Interest Capitalized"] = \
+                display_actual["Monthly Interest Capitalized"].apply(format_inr)
+
+            st.dataframe(display_actual, use_container_width=True, hide_index=True)
