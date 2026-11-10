@@ -6,7 +6,21 @@ import psycopg2
 import os
 
 # ---------------- CONFIG ----------------
-ANNUAL_RATE = 0.0725
+# Annual interest rates, effective from the listed dates (inclusive).
+# Add future rate revisions here without changing the calculation functions.
+INTEREST_RATE_SCHEDULE = [
+    (pd.Timestamp("1900-01-01"), 0.0725),
+    (pd.Timestamp("2026-10-15"), 0.0750),
+]
+
+
+def get_annual_rate(on_date):
+    """Return the annual loan interest rate applicable on a particular date."""
+    on_date = pd.Timestamp(on_date).normalize()
+    for effective_date, annual_rate in reversed(INTEREST_RATE_SCHEDULE):
+        if on_date >= effective_date:
+            return annual_rate
+    raise ValueError(f"No interest rate configured for {on_date.date()}")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
@@ -154,14 +168,16 @@ def simulate_until_closure(df, emi_amount=90352, emi_only=False):
         if balance <= 0:
             break
 
-        # Daily interest
-        interest = balance * ANNUAL_RATE / 365
+        # Daily interest at the rate in force on this date
+        annual_rate = get_annual_rate(current_date)
+        interest = balance * annual_rate / 365
         monthly_interest += interest
 
         rows.append({
             "Date": current_date,
             "Outstanding": balance,
             "Interest Today": interest,
+            "Interest Rate (%)": round(annual_rate * 100, 2),
             "EMI Applied": emi_applied,
             "Monthly Interest Capitalized": monthly_capitalized
         })
@@ -212,13 +228,15 @@ def build_daily_table(df):
         if ds in tx_map:
             balance += tx_map[ds]
 
-        interest = balance * ANNUAL_RATE / 365
+        annual_rate = get_annual_rate(d)
+        interest = balance * annual_rate / 365
         monthly_interest += interest
 
         rows.append({
             "Date": d,
             "Outstanding": round(balance, 2),
             "Interest": round(interest, 2),
+            "Interest Rate (%)": round(annual_rate * 100, 2),
             "MonthLabel": d.strftime("%B %Y"),
             "MonthKey": month_key,
         })
@@ -323,7 +341,7 @@ if menu == "Dashboard":
             with st.expander(month_label, expanded=False):
 
                 display = group[
-                    ["SNo", "Date", "Outstanding", "Interest"]
+                    ["SNo", "Date", "Outstanding", "Interest Rate (%)", "Interest"]
                 ].copy()
 
                 display["Date"] = display["Date"].dt.strftime("%d-%m-%Y")
@@ -332,6 +350,7 @@ if menu == "Dashboard":
                     "S.No",
                     "Date",
                     "Outstanding Balance",
+                    "Interest Rate (%)",
                     "Interest Accrued (Day)"
                 ]
 
